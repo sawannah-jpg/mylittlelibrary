@@ -1493,6 +1493,54 @@ function setTimerProgMode(m){
   document.getElementById('tprog-pct-btn').style.background=m==='pct'?'var(--blush)':'transparent';
 }
 
+// ── PROGRESS SYNC HELPER ──
+// Adds session progress ON TOP of existing book progress, clamps, auto-finishes,
+// persists to localStorage + Supabase, and re-renders the whole UI.
+async function applyProgressToBook(bookId, sessionPages, sessionPct){
+  const b = books.find(x => x.id == bookId);
+  if(!b) return;
+
+  if(sessionPages && sessionPages > 0){
+    // PAGE-BASED: add pages on top of current
+    const newRead = (b.pagesRead || 0) + sessionPages;
+    const total   = b.pagesTotal || 0;
+    b.pagesRead   = total ? Math.min(newRead, total) : newRead;
+    if(total) b.progressPct = Math.round(b.pagesRead / total * 100);
+    // Auto-finish
+    if(total && b.pagesRead >= total){
+      b.status = 'read';
+      if(!b.dateFinished) b.dateFinished = new Date().toISOString().slice(0,10);
+    }
+  } else if(sessionPct && sessionPct > 0){
+    // PCT-BASED: add percentage on top of current
+    const newPct  = (b.progressPct || 0) + sessionPct;
+    b.progressPct = Math.min(newPct, 100);
+    // If we had page tracking too, scale pagesRead
+    if(b.pagesTotal){
+      b.pagesRead = Math.min(Math.round(b.progressPct / 100 * b.pagesTotal), b.pagesTotal);
+    }
+    // Auto-finish
+    if(b.progressPct >= 100){
+      b.status = 'read';
+      if(!b.dateFinished) b.dateFinished = new Date().toISOString().slice(0,10);
+    }
+  }
+
+  // Persist locally
+  save();
+
+  // Sync to Supabase
+  if(sb){
+    const err = await sbUpsertBook(b);
+    if(err) toast('Cloud sync: ' + (err.message || ''));
+  }
+
+  // Refresh UI everywhere
+  renderLibrary();
+  renderHome();
+  refreshAllDropdowns();
+}
+
 // Timer
 const timer={running:false,paused:false,startTime:null,sessionStartWall:null,elapsed:0,interval:null,bookId:null,bookTitle:'',lastLogId:null};
 function fmtMs(ms){const h=Math.floor(ms/3600000),m=Math.floor((ms%3600000)/60000),s=Math.floor((ms%60000)/1000);return`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;}
@@ -1542,25 +1590,45 @@ function timerStop(){
 async function saveTimerProgress(){
   if(!timer.lastLogId){toast('No session to update');return;}
   const entry=readingLog.find(e=>e.id===timer.lastLogId);if(!entry)return;
-  let bookToSync=null;
-  if(timerProgMode==='pages'){entry.pages=+document.getElementById('tprog-pages-read').value||0;const total=+document.getElementById('tprog-pages-total').value;if(total){const b=books.find(b=>b.id==entry.bookId);if(b){b.pagesRead=entry.pages;b.pagesTotal=total;b.progressPct=Math.round(entry.pages/total*100);bookToSync=b;save();}}}
-  else{entry.pct=+document.getElementById('tprog-pct').value;const b=books.find(b=>b.id==entry.bookId);if(b){b.progressPct=entry.pct;bookToSync=b;save();}}
-  if(sb&&bookToSync){const err=await sbUpsertBook(bookToSync);if(err)toast('Cloud sync: '+(err.message||''));}
-  DB.set('mlibrary_log',readingLog);document.getElementById('timer-progress-row').style.display='none';timer.lastLogId=null;
-  toast('Progress saved! 📖');renderLog();renderLibrary();
+
+  let sessionPages=0, sessionPct=0;
+  if(timerProgMode==='pages'){
+    sessionPages=+document.getElementById('tprog-pages-read').value||0;
+    const total=+document.getElementById('tprog-pages-total').value||0;
+    entry.pages=sessionPages;
+    // Store total on the book if provided and not yet set
+    if(total){const b=books.find(b=>b.id==entry.bookId);if(b&&!b.pagesTotal){b.pagesTotal=total;}}
+  } else {
+    sessionPct=+document.getElementById('tprog-pct').value||0;
+    entry.pct=sessionPct;
+  }
+
+  DB.set('mlibrary_log',readingLog);
+  document.getElementById('timer-progress-row').style.display='none';
+  timer.lastLogId=null;
+
+  await applyProgressToBook(entry.bookId, sessionPages, sessionPct);
+  toast('Progress saved! 📖');
+  renderLog();
 }
 
-function addLogEntry(){
+async function addLogEntry(){
   const bookId=document.getElementById('log-book-select').value,book=books.find(b=>b.id==bookId);
   const dur=parseInt(document.getElementById('log-duration').value)||0,date=document.getElementById('log-date').value,notes=document.getElementById('log-notes').value.trim();
   if(!book){toast('Please select a book 📚');return;}if(!dur){toast('Please enter duration 🌸');return;}if(!date){toast('Please select a date 🌸');return;}
-  let pages=0,pct=null;
-  if(logProgressMode==='pages')pages=parseInt(document.getElementById('log-pages').value)||0;
-  else pct=parseInt(document.getElementById('log-pct').value)||0;
-  readingLog.unshift({id:Date.now(),bookId:book.id,title:book.title,dur,pages,pct,date,notes});
+
+  let sessionPages=0,sessionPct=0;
+  if(logProgressMode==='pages') sessionPages=parseInt(document.getElementById('log-pages').value)||0;
+  else sessionPct=parseInt(document.getElementById('log-pct').value)||0;
+
+  readingLog.unshift({id:Date.now(),bookId:book.id,title:book.title,dur,pages:sessionPages,pct:sessionPct||null,date,notes});
   DB.set('mlibrary_log',readingLog);
+
   document.getElementById('log-duration').value='';document.getElementById('log-pages').value='';document.getElementById('log-pct').value=0;document.getElementById('log-pct-val').textContent='0%';document.getElementById('log-notes').value='';
-  toast('Session logged! 📅');renderLog();
+
+  await applyProgressToBook(book.id, sessionPages, sessionPct);
+  toast('Session logged & progress updated! 📅');
+  renderLog();
 }
 
 function calcStreak(){
